@@ -1,0 +1,261 @@
+# https://www.andrewheiss.com/blog/2023/07/28/gradient-map-fills-r-sf/
+
+```{r}
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(
+  tidyverse,
+  sf,
+  spatstat,
+  tigris,
+  rnaturalearth,
+  patchwork,
+  stars
+)
+
+theme_set(
+  theme_void(base_family = "Roboto Slab") +
+    theme(plot.title = element_text(face = "bold", hjust = 0.5))
+)
+```
+
+```{r}
+# We'll make all the shapefiles use ESRI:102118 (NAD 1927 Georgia Statewide
+# Albers: https://epsg.io/102118)
+ga_crs <- st_crs("ESRI:102118")
+
+# Geographic data from Georgia
+ga_cultural <- read_sf("data/cultural/cultural.shp") %>% 
+  # This shapefile uses EPSG:4326 (WGS 84), but that projection information
+  # isn't included in the shapefile for whatever reason, so we need to set it
+  st_set_crs(st_crs("EPSG:4326"))
+
+ga_campgrounds <- ga_cultural %>% 
+  filter(DESCRIPTOR == "CAMP/CAMPGROUND") %>% 
+  st_transform(ga_crs)
+```
+
+```{r}
+# Geographic data from the US Census
+options(tigris_use_cache = TRUE)
+Sys.setenv(TIGRIS_CACHE_DIR = "maps")
+
+ga_state <- states(cb = TRUE, resolution = "500k", year = 2022) %>% 
+  filter(STUSPS == "GA") %>% 
+  st_transform(ga_crs)
+
+ga_counties <- counties(state = "13", cb = TRUE, resolution = "500k", year = 2022) %>% 
+  st_transform(ga_crs)
+```
+
+```{r}
+# See rnaturalearth::df_layers_physical for all possible names
+# Create a vector of the four datasets we want
+ne_shapes_to_get <- c(
+  "rivers_lake_centerlines", "rivers_north_america",
+  "lakes", "lakes_north_america"
+)
+
+# Loop through ne_shapes_to_get and download each shapefile and store it locally
+if (!file.exists("maps/ne_10m_lakes.shp")) {
+  ne_shapes_to_get %>%
+    walk(~ ne_download(
+      scale = 10, type = .x, category = "physical",
+      destdir = "maps", load = FALSE
+    ))
+}
+
+# Load each pre-downloaded shapefile and store it in a list
+ne_data_list <- ne_shapes_to_get %>%
+  map(~ {
+    ne_load(
+      scale = 10, type = .x, category = "physical",
+      destdir = "maps", returnclass = "sf"
+    ) %>%
+      st_transform(ga_crs)
+  }) %>%
+  set_names(ne_shapes_to_get)
+
+# Load all the datasets in the list into the global environment
+list2env(ne_data_list, envir = .GlobalEnv)
+```
+
+```{r}
+# ↓ these give a bunch of (harmless?) warnings about spatially constant attributes
+rivers_global_ga <- st_intersection(ga_state, rivers_lake_centerlines)
+rivers_na_ga <- st_intersection(ga_state, rivers_north_america)
+lakes_global_ga <- st_intersection(ga_state, lakes)
+lakes_na_ga <- st_intersection(ga_state, lakes_north_america)
+```
+
+```{r}
+plot_initial <- ggplot() +
+  geom_sf(data = ga_state, fill = "grey20") +
+  geom_sf(data = rivers_global_ga, linewidth = 0.3, color = "white") +
+  geom_sf(data = rivers_na_ga, linewidth = 0.1, color = "white") +
+  geom_sf(data = lakes_global_ga, fill = "white", color = NA) +
+  geom_sf(data = lakes_na_ga, fill = "white", color = NA) +
+  geom_sf(data = ga_campgrounds, size = 0.5, color = "grey50") +
+  # Technically this isn't necessary since all the layers already use 102118, but
+  # we'll add it just in case I forgot to do that to one of them
+  coord_sf(crs = ga_crs)
+plot_initial
+```
+
+# Option 1: Fill each county by the number of campgrounds
+```{r}
+# st_join() adds extra rows for repeated counties and returns partially blank
+# rows for counties with no campgrounds. It would ordinarily be easy to use
+# `summarize(total = n())`, but this won't be entirely accurate since counties
+# without campgrounds still appear in the combined data and would get
+# incorrectly counted. So instead, we look at one of the columns from
+# ga_campgrounds (DESCRIPTOR). If it's NA, it means that the county it was
+# joined to didn't have any campgrounds, so we can ignore it when counting.
+ga_counties_campgrounds <- ga_counties %>% 
+  st_join(ga_campgrounds) %>% 
+  group_by(NAMELSAD) %>% 
+  summarize(total = sum(!is.na(DESCRIPTOR)))
+```
+
+```{r}
+plot_county <- ggplot() +
+  geom_sf(data = ga_counties_campgrounds, aes(fill = total), color = NA) +
+  geom_sf(data = ga_state, fill = NA, color = "black", linewidth = 0.25) +
+  geom_sf(data = rivers_global_ga, linewidth = 0.3, color = "white") +
+  geom_sf(data = rivers_na_ga, linewidth = 0.1, color = "white") +
+  geom_sf(data = lakes_global_ga, fill = "white", color = NA) +
+  geom_sf(data = lakes_na_ga, fill = "white", color = NA) +
+  scale_fill_viridis_c(option = "magma", guide = "none", na.value = "black") +
+  coord_sf(crs = ga_crs)
+plot_county
+```
+
+# Option 2: Create a grid and fill each grid box by the number of campgrounds
+```{r}
+# Spit the state area into a 20x20 grid
+ga_grid <- ga_state %>% 
+  st_make_grid(n = c(20, 20))
+
+ggplot() +
+  geom_sf(data = ga_state) +
+  geom_sf(data = ga_grid, alpha = 0.3) +
+  theme_void()
+```
+
+```{r}
+ga_grid_map <- st_intersection(ga_state, ga_grid) %>% 
+  st_as_sf() %>% 
+  mutate(grid_id = 1:n())
+
+ggplot() +
+  geom_sf(data = ga_grid_map) +
+  theme_void()
+```
+
+```{r}
+campgrounds_per_grid_box <- ga_grid_map %>% 
+  st_join(ga_campgrounds) %>% 
+  group_by(grid_id) %>% 
+  summarize(total = sum(!is.na(DESCRIPTOR)))
+```
+
+```{r}
+plot_grid <- ggplot() +
+  geom_sf(data = campgrounds_per_grid_box, aes(fill = total), color = NA) +
+  geom_sf(data = ga_state, fill = NA, color = "black", linewidth = 0.25) +
+  geom_sf(data = rivers_global_ga, linewidth = 0.3, color = "white") +
+  geom_sf(data = rivers_na_ga, linewidth = 0.1, color = "white") +
+  geom_sf(data = lakes_global_ga, fill = "white", color = NA) +
+  geom_sf(data = lakes_na_ga, fill = "white", color = NA) +
+  scale_fill_viridis_c(option = "magma", guide = "none") +
+  coord_sf(crs = ga_crs)
+plot_grid
+```
+
+# Option 3: Fill with a gradient of the density of the number of campgrounds
+```{r}
+# Convert the campground coordinates to a ppp object with a built-in window
+ga_campgrounds_ppp <- as.ppp(ga_campgrounds$geometry, W = as.owin(ga_state))
+
+# Check to see if it worked
+plot(ga_campgrounds_ppp)
+```
+
+```{r}
+# Create a stars object of the density of campground locations
+density_campgrounds_stars <- stars::st_as_stars(density(ga_campgrounds_ppp, dimyx = 300))
+
+# Check to see what it looks like
+plot(density_campgrounds_stars)
+```
+
+```{r}
+ga_campgrounds_density <- st_as_sf(density_campgrounds_stars) %>%
+  st_set_crs(ga_crs)
+```
+
+```{r}
+plot_density <- ggplot() +
+  geom_sf(data = ga_campgrounds_density, aes(fill = v), color = NA) +
+  geom_sf(data = ga_state, fill = NA, color = "black", linewidth = 0.25) +
+  scale_fill_viridis_c(option = "magma", guide = "none")
+plot_density
+```
+
+```{r}
+plot_density_fancy <- ggplot() +
+  geom_sf(data = ga_campgrounds_density, aes(fill = v), color = NA) +
+  geom_sf(data = ga_state, fill = NA, color = "black", linewidth = 0.25) +
+  geom_sf(data = rivers_global_ga, linewidth = 0.3, color = "white") +
+  geom_sf(data = rivers_na_ga, linewidth = 0.1, color = "white") +
+  geom_sf(data = lakes_global_ga, fill = "white", color = NA) +
+  geom_sf(data = lakes_na_ga, fill = "white", color = NA) +
+  scale_fill_viridis_c(option = "magma", guide = "none") +
+  coord_sf(crs = ga_crs)
+plot_density_fancy
+```
+
+```{r}
+plot_density_fancy_points <- ggplot() +
+  geom_sf(data = ga_campgrounds_density, aes(fill = v), color = NA) +
+  geom_sf(data = ga_state, fill = NA, color = "black", linewidth = 0.25) +
+  geom_sf(data = rivers_global_ga, linewidth = 0.3, color = "white") +
+  geom_sf(data = rivers_na_ga, linewidth = 0.1, color = "white") +
+  geom_sf(data = lakes_global_ga, fill = "white", color = NA) +
+  geom_sf(data = lakes_na_ga, fill = "white", color = NA) +
+  geom_sf(data = ga_campgrounds, size = 0.3, color = "grey80") +
+  scale_fill_viridis_c(option = "magma", guide = "none") +
+  coord_sf(crs = ga_crs)
+plot_density_fancy_points
+```
+
+# Extra bonus fun: 10,000+ churches
+```{r}
+ga_churches <- ga_cultural %>% 
+  filter(DESCRIPTOR == "CHURCH") %>% 
+  st_transform(st_crs("ESRI:102118"))
+
+ggplot() +
+  geom_sf(data = ga_state) +
+  geom_sf(data = ga_churches)
+```
+
+```{r}
+# Convert the church coordinates to a ppp object with a built-in window
+ga_churches_ppp <- as.ppp(ga_churches$geometry, W = as.owin(ga_state))
+
+# Create a stars object (whatever that is) of the density of church locations
+density_churches_stars <- stars::st_as_stars(density(ga_churches_ppp, dimyx = 300))
+
+# Convert the stars object to an sf object so it's normal and plottable again
+ga_churches_density <- st_as_sf(density_churches_stars) %>%
+  st_set_crs(ga_crs)
+```
+
+```{r}
+ggplot() +
+  geom_sf(data = ga_churches_density, aes(fill = v), color = NA) +
+  geom_sf(data = ga_state, fill = NA, color = "black", linewidth = 0.25) +
+  geom_sf(data = ga_churches, size = 0.005, alpha = 0.3) +
+  scale_fill_viridis_c(option = "rocket", guide = "none") +
+  theme_void()
+```
