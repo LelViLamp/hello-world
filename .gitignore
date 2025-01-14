@@ -1,6 +1,7 @@
 local-only/
 temp/
 tmp/
+.env
 
 # Linux-specific ignores
 # https://github.com/github/gitignore/blob/main/Global/Linux.gitignore
