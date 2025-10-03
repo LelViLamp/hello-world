@@ -372,17 +372,27 @@ async def generate_storyboard_with_events(storyboard_idea: str, emitter: EventEm
 # endregion
 
 
+async def print_event_to_console(event):
+    print(f"{event.timestamp} [{event.event_type.value}]", end="")
+    if event.data:
+        print(f": {event.data}", end="")
+    print()
+
+
 async def simulate_storyboard_generation(storyboard_idea: str) -> Storyboard:
     emitter = EventEmitter()
     storyboard_task = asyncio.create_task(
         generate_storyboard_with_events(storyboard_idea, emitter),
     )
 
+    async def close_after_completion():
+        await storyboard_task
+        await emitter.close()
+
+    asyncio.create_task(close_after_completion())
+
     async for event in emitter.events():
-        print(f"{event.timestamp} [{event.event_type.value}]", end="")
-        if event.data:
-            print(f": {event.data}", end="")
-        print()
+        await print_event_to_console(event)
 
     storyboard = await storyboard_task
     return storyboard
@@ -392,4 +402,4 @@ if __name__ == '__main__':
     storyboard = asyncio.run(
         simulate_storyboard_generation("A story about a hero's journey through mystical lands"),
     )
-    print(storyboard)
+    print("", "-" * 42 * 2, storyboard, sep="\n")
