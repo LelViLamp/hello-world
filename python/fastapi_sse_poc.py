@@ -1,11 +1,14 @@
 import asyncio
 import random
+from contextlib import asynccontextmanager
 from datetime import datetime
 from enum import Enum
 from typing import Any, AsyncIterator, Optional
 from uuid import UUID, uuid4
 
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
+from starlette.responses import StreamingResponse
 
 # region config
 MIN_WAIT_TIME = 1.0
@@ -231,11 +234,7 @@ async def execute_single_query(query: Query) -> list[Asset]:
     return assets
 
 
-async def execute_query_with_events(
-    query: Query,
-    emitter: EventEmitter,
-    scene_index: int,
-) -> list[Asset]:
+async def execute_query_with_events(query: Query, emitter: EventEmitter, scene_index: int) -> list[Asset]:
     """Execute a single query and emit events to the queue."""
     await emitter.emit(ProgressEvent(event_type=EventType.SINGLE_SCENE_SINGLE_QUERY_EXECUTION_STARTED))
 
@@ -388,6 +387,7 @@ async def generate_storyboard_with_events(storyboard_idea: str, emitter: EventEm
 # endregion
 
 
+# region simulate event emission and consumption (by printing to console)
 async def print_event_to_console(event):
     print(f"{event.timestamp} [{event.event_type.value}]", end="")
     if event.data:
@@ -412,6 +412,88 @@ async def simulate_storyboard_generation(storyboard_idea: str) -> Storyboard:
 
     storyboard = await storyboard_task
     return storyboard
+
+
+# endregion
+
+
+# region FastAPI PoC
+class StoryboardRequest(BaseModel):
+    storyboard_idea: str
+    stream: bool = True
+
+
+class StoryboardResponse(BaseModel):
+    storyboard: Storyboard
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print("Starting FastAPI app")
+    yield
+    print("Stopping FastAPI app")
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+async def event_stream(storyboard_idea: str):
+    emitter = EventEmitter()
+    storyboard_task = asyncio.create_task(
+        generate_storyboard_with_events(storyboard_idea, emitter),
+    )
+
+    async def close_after_completion():
+        try:
+            await storyboard_task
+        finally:
+            await emitter.close()
+
+    asyncio.create_task(close_after_completion())
+
+    async for event in emitter.events():
+        # Format as SSE
+        yield f"event: progress\ndata: {event.model_dump()}\n\n"
+
+    storyboard = await storyboard_task
+    yield f"event: complete\ndata: {storyboard.model_dump()}\n\n"
+
+
+@app.post("/api/storyboards/generate", response_model=StoryboardResponse)
+async def generate_storyboard_endpoint(request: StoryboardRequest):
+    if not request.storyboard_idea.strip():
+        raise HTTPException(status_code=400, detail="Storyboard idea cannot be empty")
+
+    if request.stream:
+        return StreamingResponse(
+            event_stream(request.storyboard_idea),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+    else:
+        emitter = EventEmitter()
+        storyboard_task = asyncio.create_task(
+            generate_storyboard_with_events(request.storyboard_idea, emitter),
+        )
+
+        async def close_after_completion():
+            await storyboard_task
+            await emitter.close()
+
+        asyncio.create_task(close_after_completion())
+
+        async for _ in emitter.events():
+            pass
+
+        storyboard = await storyboard_task
+        return StoryboardResponse(storyboard=storyboard)
+
+
+# endregion
 
 
 if __name__ == '__main__':
