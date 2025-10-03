@@ -244,7 +244,11 @@ async def execute_query_with_events(
     await emitter.emit(
         ProgressEvent(
             event_type=EventType.SINGLE_SCENE_SINGLE_QUERY_EXECUTION_COMPLETED,
-            data={"scene_index": scene_index, "query_index": query.query_index, "num_results": len(assets)},
+            data={
+                "scene_index": scene_index,
+                "query_index": query.query_index,
+                "num_results": len(assets),
+            },
         ),
     )
     return assets
@@ -280,6 +284,7 @@ async def generate_and_execute_queries_with_events(scene: Scene, emitter: EventE
             event_type=EventType.SINGLE_SCENE_ALL_QUERY_EXECUTION_COMPLETED,
             data={
                 "scene_index": scene.scene_index,
+                "num_queries": len(scene.queries),
                 "num_results": sum(len(q.assets) for q in scene.queries),
             },
         ),
@@ -287,7 +292,11 @@ async def generate_and_execute_queries_with_events(scene: Scene, emitter: EventE
     await emitter.emit(
         ProgressEvent(
             event_type=EventType.SINGLE_SCENE_ALL_QUERY_GENERATION_AND_EXECUTION_COMPLETED,
-            data={"scene_index": scene.scene_index},
+            data={
+                "scene_index": scene.scene_index,
+                "num_queries": len(scene.queries),
+                "num_results": sum(len(q.assets) for q in scene.queries),
+            },
         ),
     )
 
@@ -348,7 +357,14 @@ async def generate_storyboard_with_events(storyboard_idea: str, emitter: EventEm
     ]
     scenes = await asyncio.gather(*query_processing_tasks)
     await emitter.emit(
-        ProgressEvent(event_type=EventType.ALL_SCENES_ALL_QUERY_GENERATION_AND_EXECUTION_COMPLETED),
+        ProgressEvent(
+            event_type=EventType.ALL_SCENES_ALL_QUERY_GENERATION_AND_EXECUTION_COMPLETED,
+            data={
+                "num_scenes": len(scenes),
+                "num_queries": sum(len(s.queries) for s in scenes),
+                "num_results": sum(len(q.assets) for s in scenes for q in s.queries),
+            },
+        ),
     )
 
     # assemble everything into an object and emit final event
