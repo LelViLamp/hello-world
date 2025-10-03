@@ -2,7 +2,7 @@ import asyncio
 import random
 from datetime import datetime
 from enum import Enum
-from typing import Any, AsyncIterator, Optional, Tuple
+from typing import Any, AsyncIterator, Optional
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field
@@ -190,12 +190,7 @@ async def generate_single_scene(scene_index: int, scene_idea: str) -> Scene:
 
 async def generate_single_scene_with_events(scene_index: int, scene_idea: str, emitter: EventEmitter) -> Scene:
     """Generate a single scene and emit events to the queue."""
-    await emitter.emit(
-        ProgressEvent(
-            event_type=EventType.SINGLE_SCENE_TEXT_GENERATION_STARTED,
-            data={"scene_index": scene_index},
-        ),
-    )
+    await emitter.emit(ProgressEvent(event_type=EventType.SINGLE_SCENE_TEXT_GENERATION_STARTED))
 
     scene = await generate_single_scene(scene_index, scene_idea)
 
@@ -242,12 +237,7 @@ async def execute_query_with_events(
     scene_index: int,
 ) -> list[Asset]:
     """Execute a single query and emit events to the queue."""
-    await emitter.emit(
-        ProgressEvent(
-            event_type=EventType.SINGLE_SCENE_SINGLE_QUERY_EXECUTION_STARTED,
-            data={"scene_index": scene_index, "query_index": query.query_index},
-        ),
-    )
+    await emitter.emit(ProgressEvent(event_type=EventType.SINGLE_SCENE_SINGLE_QUERY_EXECUTION_STARTED))
 
     assets = await execute_single_query(query)
 
@@ -262,20 +252,10 @@ async def execute_query_with_events(
 
 async def generate_and_execute_queries_with_events(scene: Scene, emitter: EventEmitter) -> Scene:
     """Generate and execute all queries for a scene, emitting events."""
-    await emitter.emit(
-        ProgressEvent(
-            event_type=EventType.SINGLE_SCENE_ALL_QUERY_GENERATION_AND_EXECUTION_STARTED,
-            data={"scene_index": scene.scene_index},
-        ),
-    )
+    await emitter.emit(ProgressEvent(event_type=EventType.SINGLE_SCENE_ALL_QUERY_GENERATION_AND_EXECUTION_STARTED))
 
     # step 1: generate queries
-    await emitter.emit(
-        ProgressEvent(
-            event_type=EventType.SINGLE_SCENE_QUERY_GENERATION_STARTED,
-            data={"scene_index": scene.scene_index},
-        ),
-    )
+    await emitter.emit(ProgressEvent(event_type=EventType.SINGLE_SCENE_QUERY_GENERATION_STARTED))
     queries = generate_queries_for_scene(scene)
     scene.queries = await queries
     await emitter.emit(
@@ -286,12 +266,7 @@ async def generate_and_execute_queries_with_events(scene: Scene, emitter: EventE
     )
 
     # step 2: execute all queries for this scene in parallel
-    await emitter.emit(
-        ProgressEvent(
-            event_type=EventType.SINGLE_SCENE_ALL_QUERY_EXECUTION_STARTED,
-            data={"scene_index": scene.scene_index, "num_queries": len(scene.queries)},
-        ),
-    )
+    await emitter.emit(ProgressEvent(event_type=EventType.SINGLE_SCENE_ALL_QUERY_EXECUTION_STARTED))
     query_tasks = [
         execute_query_with_events(query, emitter, scene.scene_index)
         for query in scene.queries
@@ -305,10 +280,7 @@ async def generate_and_execute_queries_with_events(scene: Scene, emitter: EventE
             event_type=EventType.SINGLE_SCENE_ALL_QUERY_EXECUTION_COMPLETED,
             data={
                 "scene_index": scene.scene_index,
-                "result_counts": {
-                    q.query_index: len(q.assets)
-                    for q in scene.queries
-                },
+                "num_results": sum(len(q.assets) for q in scene.queries),
             },
         ),
     )
@@ -326,108 +298,95 @@ async def generate_and_execute_queries_with_events(scene: Scene, emitter: EventE
 
 
 # region put it all together
-async def generate_storyboard_with_events(
-    storyboard_idea: str,
-) -> Tuple[AsyncIterator[ProgressEvent], asyncio.Future[Storyboard]]:
-    emitter = EventEmitter()
-    storyboard_future = asyncio.Future()
+async def generate_storyboard_with_events(storyboard_idea: str, emitter: EventEmitter) -> Storyboard:
+    await emitter.emit(
+        ProgressEvent(event_type=EventType.STORYBOARD_GENERATION_STARTED),
+    )
 
-    async def main_processing():
-        try:
-            await emitter.emit(
-                ProgressEvent(
-                    event_type=EventType.STORYBOARD_GENERATION_STARTED,
-                    data={"storyboard_idea": storyboard_idea},
-                ),
-            )
+    # step 1: analyse storyboard
+    await emitter.emit(ProgressEvent(event_type=EventType.STORYBOARD_ANALYSIS_STARTED))
+    analysis = await analyse_storyboard(storyboard_idea)
+    await emitter.emit(
+        ProgressEvent(
+            event_type=EventType.STORYBOARD_ANALYSIS_COMPLETED,
+            data=analysis.model_dump(),
+        ),
+    )
 
-            # step 1: analyse storyboard
-            await emitter.emit(ProgressEvent(event_type=EventType.STORYBOARD_ANALYSIS_STARTED))
-            analysis = await analyse_storyboard(storyboard_idea)
-            await emitter.emit(
-                ProgressEvent(
-                    event_type=EventType.STORYBOARD_ANALYSIS_COMPLETED,
-                    data=analysis.model_dump(),
-                ),
-            )
+    # step 2: generate scene ideas
+    await emitter.emit(ProgressEvent(event_type=EventType.SCENE_IDEA_GENERATION_STARTED))
+    scene_ideas = await generate_scene_ideas(analysis)
+    await emitter.emit(
+        ProgressEvent(
+            event_type=EventType.SCENE_IDEA_GENERATION_COMPLETED,
+            data={"num_scene_ideas": len(scene_ideas)},
+        ),
+    )
 
-            # step 2: generate scene ideas
-            await emitter.emit(ProgressEvent(event_type=EventType.SCENE_IDEA_GENERATION_STARTED))
-            scene_ideas = await generate_scene_ideas(analysis)
-            await emitter.emit(ProgressEvent(event_type=EventType.SCENE_IDEA_GENERATION_COMPLETED))
+    # step 3: generate texts for each scene in parallel
+    await emitter.emit(ProgressEvent(event_type=EventType.ALL_SCENE_TEXT_GENERATION_STARTED))
+    scene_tasks = [
+        generate_single_scene_with_events(scene_index, scene_idea, emitter)
+        for scene_index, scene_idea in enumerate(scene_ideas)
+    ]
+    scenes = await asyncio.gather(*scene_tasks)
+    sorted(scenes, key=lambda s: s.scene_index)
+    await emitter.emit(
+        ProgressEvent(
+            event_type=EventType.ALL_SCENE_TEXT_GENERATION_COMPLETED,
+            data={"num_scenes": len(scenes)},
+        ),
+    )
 
-            # step 3: generate texts for each scene in parallel
-            await emitter.emit(ProgressEvent(event_type=EventType.ALL_SCENE_TEXT_GENERATION_STARTED))
-            scene_tasks = [
-                generate_single_scene_with_events(scene_index, scene_idea, emitter)
-                for scene_index, scene_idea in enumerate(scene_ideas)
-            ]
-            scenes = await asyncio.gather(*scene_tasks)
-            sorted(scenes, key=lambda s: s.scene_index)
-            await emitter.emit(ProgressEvent(event_type=EventType.ALL_SCENE_TEXT_GENERATION_COMPLETED))
+    # step 4: generate and execute queries in parallel for all scenes
+    await emitter.emit(
+        ProgressEvent(event_type=EventType.ALL_SCENES_ALL_QUERY_GENERATION_AND_EXECUTION_STARTED),
+    )
+    query_processing_tasks = [
+        generate_and_execute_queries_with_events(scene, emitter)
+        for scene in scenes
+    ]
+    scenes = await asyncio.gather(*query_processing_tasks)
+    await emitter.emit(
+        ProgressEvent(event_type=EventType.ALL_SCENES_ALL_QUERY_GENERATION_AND_EXECUTION_COMPLETED),
+    )
 
-            # step 4: generate and execute queries in parallel for all scenes
-            await emitter.emit(
-                ProgressEvent(event_type=EventType.ALL_SCENES_ALL_QUERY_GENERATION_AND_EXECUTION_STARTED),
-            )
-            query_processing_tasks = [
-                generate_and_execute_queries_with_events(scene, emitter)
-                for scene in scenes
-            ]
-            scenes = await asyncio.gather(*query_processing_tasks)
-            await emitter.emit(
-                ProgressEvent(event_type=EventType.ALL_SCENES_ALL_QUERY_GENERATION_AND_EXECUTION_COMPLETED),
-            )
-
-            # assemble everything into an object and emit final event
-            storyboard = Storyboard(
-                _original_storyboard_idea=storyboard_idea,
-                _storyboard_analysis=analysis,
-                _scene_ideas=scene_ideas,
-                scenes=scenes,
-            )
-            storyboard_future.set_result(storyboard)
-
-            await emitter.emit(
-                ProgressEvent(
-                    event_type=EventType.STORYBOARD_GENERATION_COMPLETED,
-                    data={"storyboard_id": str(storyboard.storyboard_id)},
-                ),
-            )
-        except Exception as e:
-            storyboard_future.set_exception(e)
-            raise
-        finally:
-            await emitter.close()
-
-    # Start main processing in background
-    processing_task = asyncio.create_task(main_processing())
-
-    # Yield events as they arrive
-    async def event_generator():
-        async for event in emitter.events():
-            yield event
-        await processing_task
-
-    return event_generator(), storyboard_future
-
-
-async def simulate_storyboard_generation(storyboard_idea: str) -> Storyboard:
-    event_stream, storyboard_future = await generate_storyboard_with_events(storyboard_idea)
-
-    async for event in event_stream:
-        print(f"{event.timestamp} [{event.event_type.value}]", end="")
-        if event.data:
-            print(f": {event.data}", end="")
-        print()
-
-    storyboard = await storyboard_future
+    # assemble everything into an object and emit final event
+    storyboard = Storyboard(
+        _original_storyboard_idea=storyboard_idea,
+        _storyboard_analysis=analysis,
+        _scene_ideas=scene_ideas,
+        scenes=scenes,
+    )
+    await emitter.emit(
+        ProgressEvent(
+            event_type=EventType.STORYBOARD_GENERATION_COMPLETED,
+            data={"storyboard_id": str(storyboard.storyboard_id)},
+        ),
+    )
     return storyboard
 
 
 # endregion
 # endregion
 # endregion
+
+
+async def simulate_storyboard_generation(storyboard_idea: str) -> Storyboard:
+    emitter = EventEmitter()
+    storyboard_task = asyncio.create_task(
+        generate_storyboard_with_events(storyboard_idea, emitter),
+    )
+
+    async for event in emitter.events():
+        print(f"{event.timestamp} [{event.event_type.value}]", end="")
+        if event.data:
+            print(f": {event.data}", end="")
+        print()
+
+    storyboard = await storyboard_task
+    return storyboard
+
 
 if __name__ == '__main__':
     storyboard = asyncio.run(
