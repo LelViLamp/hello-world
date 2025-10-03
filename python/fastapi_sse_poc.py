@@ -47,7 +47,7 @@ class EventType(str, Enum):
 
 
 class ProgressEvent(BaseModel):
-    timestamp: datetime = datetime.now()
+    timestamp: datetime = Field(default_factory=datetime.now)
     event_id: UUID = Field(default_factory=uuid4)
     event_type: EventType
     data: Optional[dict[str, Any]] = None
